@@ -3,7 +3,6 @@
 import { useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
-import { initializeResourceOptimizations } from '@/lib/resourcePriority'
 import MagicalBackground from '@/components/ui/MagicalBackground'
 import LoadingMagic from '@/components/ui/LoadingMagic'
 
@@ -12,9 +11,6 @@ export default function Home() {
   const supabase = createClient()
 
   useEffect(() => {
-    // Initialize resource preloading for maximum performance
-    initializeResourceOptimizations('/')
-    
     // Register service worker for instant loading
     if (process.env.NODE_ENV === 'production') {
       import('@/lib/serviceWorker').then(({ registerServiceWorker }) => {

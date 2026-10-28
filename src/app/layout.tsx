@@ -1,9 +1,8 @@
 import type { Metadata, Viewport } from "next";
 import DeviceInfo from "@/components/ui/DeviceInfo";
-import PerformanceTracker from "@/components/PerformanceTracker";
 import "./globals.css";
 
-const GAME_VERSION = '3.3';
+const GAME_VERSION = '3.4';
 
 export const metadata: Metadata = {
   title: "Quidditch Academy - Magical Sports Game",
@@ -42,7 +41,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         
       </head>
       <body className="min-h-full flex flex-col">
-        <PerformanceTracker />
         <DeviceInfo />
         {children}
         <div className="fixed bottom-1 right-2 z-[100] rounded-md border border-amber-300/30 bg-slate-950/80 px-2 py-0.5 text-[10px] font-black tracking-wider text-amber-200/80 shadow-lg">

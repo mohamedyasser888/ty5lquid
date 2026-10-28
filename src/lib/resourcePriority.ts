@@ -7,21 +7,9 @@
  * Preload critical images
  */
 export function preloadCriticalImages() {
-  if (typeof window === 'undefined') return
-
-  const criticalImages = [
-    '/quid.webp',
-    '/snitch.webp',
-  ]
-
-  criticalImages.forEach(src => {
-    const link = document.createElement('link')
-    link.rel = 'preload'
-    link.as = 'image'
-    link.type = 'image/webp'
-    link.href = src
-    document.head.appendChild(link)
-  })
+  // Game-only images are loaded by the game screen when they are actually
+  // needed. Preloading them from the landing route wastes bandwidth and can
+  // delay login/home on slower devices.
 }
 
 /**
@@ -151,7 +139,6 @@ export function initializeResourceOptimizations(currentPath: string) {
 function runOptimizations(currentPath: string) {
   // Run after a short delay to not block main thread
   requestIdleCallback(() => {
-    preloadCriticalImages()
     prefetchLikelyPages(currentPath)
     preconnectExternalServices()
   }, { timeout: 2000 })
