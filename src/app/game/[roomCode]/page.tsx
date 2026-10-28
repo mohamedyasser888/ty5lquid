@@ -51,6 +51,8 @@ interface Combat {
   phase:       'spinning' | 'spinning_anim' | 'reveal'
   result:      'win' | 'lose' | null
   spinTarget?: number
+  fromCol?: Col
+  fromRow?: number
 }
 
 interface GoalDuel {
@@ -79,7 +81,8 @@ interface GS {
   combat:        Combat | null
   d1:            boolean
   d2:            boolean
-  turnCount:     number                              // increments every MOVE
+  turnCount:     number                              // increments every MOVE (including seeker bonus)
+  regularMoveCount?: number                       // increments only for regular moves (not seeker bonus)
   snitchPos:     { col: Col; row: number } | null   // snitch location on board
   snitchPhase:   null | 'appearing' | 'spinning' | 'active' | 'encounter' | 'catching' | 'hiding' | 'caught'
   snitchSquares?: string[]
@@ -92,8 +95,11 @@ interface GS {
   snitchWheelContext?: SnitchWheelContext
   snitchHiddenMoves?: number
   snitchEncounterPending?: boolean
-  snitchEncounterDelayTurns?: number  // Legacy — migrated to snitchWaitTurnsCompleted
-  snitchWaitTurnsCompleted?: number   // Completed turns since seekers began waiting (trigger at 2)
+  snitchEncounterDelayTurns?: number  // Legacy — migrated to snitchWaitMovesCompleted
+  snitchWaitMovesCompleted?: number   // Completed MOVES since snitch reappeared (trigger at 2)
+  snitchWaitRequired?: boolean        // True when snitch REappeared and needs 2-move wait
+  snitchWaitTeams?: Team[]            // Teams that have completed a regular move during the current wait
+  snitchWaitTurnClosed?: boolean      // True only after the current player's turn/bonus choice is closed
   seekerBonusMoveActive?: boolean     // True when player can take bonus move after moving seeker
   attackerScoringChoice?: string      // AttackerId when attacker can choose to score or stay after winning combat
   snitchCatchLabels?: string[]
@@ -186,6 +192,7 @@ function initGS(matchId?: string): GS {
     ],
     turn: 1 as Team, s1: 0, s2: 0, saves1: 0, saves2: 0, streak1: 0, streak2: 0, streakBonusTeam: null, duel: null, combat: null, d1: false, d2: false,
     turnCount:     0,
+    regularMoveCount: 0,  // Initialize regular move counter
     snitchPos:     null,
     snitchPhase:   null,
     snitchHiddenMoves: 0, // Initialize hidden move counter to 0 for fresh matches
@@ -228,25 +235,23 @@ function deployable(ps: Piece[], team: Team, type: PieceType): string[] {
   return out
 }
 
-function movable(ps: Piece[], p: Piece): string[] {
+function movable(ps: Piece[], p: Piece, phase: 'deployment' | 'match' | 'finished' = 'match'): string[] {
   const ci  = COLS.indexOf(p.col)
   const out: string[] = []
 
+  // GOALKEEPER RULE: Goalkeepers CANNOT move at all (locked in place)
   if (p.type === 'GK') {
-    const goalIndex = GOAL_ZONE_COLS.indexOf(p.col)
-    for (let d = 1; d <= 2; d++) {
-      const lc = goalIndex - d
-      if (lc < 0 || getOcc(ps, GOAL_ZONE_COLS[lc], p.row).length >= MAX_PIECES_PER_CELL) break
-      out.push(`${GOAL_ZONE_COLS[lc]}${p.row}`)
-    }
-    for (let d = 1; d <= 2; d++) {
-      const rc = goalIndex + d
-      if (rc >= GOAL_ZONE_COLS.length || getOcc(ps, GOAL_ZONE_COLS[rc], p.row).length >= MAX_PIECES_PER_CELL) break
-      out.push(`${GOAL_ZONE_COLS[rc]}${p.row}`)
-    }
-    return out
+    return []  // No valid moves for goalkeeper
   }
 
+  // DEPLOYMENT PHASE: All non-GK pieces can reposition within their deployment zone
+  if (phase === 'deployment') {
+    // Reuse the same formation rules as initial placement. This allows, for
+    // example, an attacker to move from A3 to B3 before deployment is locked.
+    return deployable(ps, p.team, p.type).filter(key => key !== `${p.col}${p.row}`)
+  }
+
+  // MATCH PHASE: Normal movement rules
   const broomSpeed = p.broomSpeed
   const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]]
 
@@ -369,18 +374,37 @@ function seekersOnSnitch(pieces: Piece[], snitchPos: GS['snitchPos']): Piece[] {
   )
 }
 
-function getSnitchWaitTurnsCompleted(s: GS): number | undefined {
-  if (s.snitchWaitTurnsCompleted !== undefined) return s.snitchWaitTurnsCompleted
-  // Migrate legacy delay counter: delay 2 → 0 turns done, delay 1 → 1 turn done
+function getSnitchWaitMovesCompleted(s: GS): number | undefined {
+  if (s.snitchWaitMovesCompleted !== undefined) return s.snitchWaitMovesCompleted
+  // Migrate legacy delay counter: delay 2 → 0 moves done, delay 1 → 1 move done
   if (s.snitchEncounterDelayTurns !== undefined) return 2 - s.snitchEncounterDelayTurns
   return undefined
+}
+
+function getSnitchWaitTeams(s: GS): Team[] {
+  return [...new Set(s.snitchWaitTeams ?? [])]
+}
+
+// Any of these states owns the board interaction. The Snitch must wait until
+// the current wheel/action is completely finished before starting its own UI.
+function hasBlockingBoardAction(s: GS): boolean {
+  return Boolean(
+    s.combat ||
+    s.duel ||
+    s.bludger ||
+    s.seekerBonusMoveActive ||
+    s.attackerScoringChoice,
+  )
 }
 
 function triggerSnitchEncounterPhase(s: GS): Partial<GS> {
   return {
     snitchPhase: 'encounter',
     snitchEncounterDelayTurns: undefined,
-    snitchWaitTurnsCompleted: undefined,
+    snitchWaitMovesCompleted: undefined,
+    snitchWaitTeams: undefined,
+    snitchWaitRequired: undefined,
+    snitchWaitTurnClosed: undefined,
     snitchEncounterPending: false,
     snitchWheelContext: s.snitchWheelContext ?? 'seeker',
     snitchOutcomeLabels: undefined,
@@ -391,32 +415,25 @@ function triggerSnitchEncounterPhase(s: GS): Partial<GS> {
 
 /** Start or advance the wait timer when seekers occupy the Snitch square (called after moves). */
 function ensureSnitchWaitActive(s: GS): Partial<GS> {
+  // Start a fresh two-team wait whenever a seeker arrives on an active Snitch.
   if (s.snitchPhase !== 'active' || !s.snitchPos) return {}
   const seekers = seekersOnSnitch(s.pieces, s.snitchPos)
   if (seekers.length === 0) return {}
 
-  const bothTeamsPresent = new Set(seekers.map(seeker => seeker.team)).size >= 2
-  const turnsCompleted = getSnitchWaitTurnsCompleted(s)
-
-  // Both seekers already present — credit one completed turn so one more turn-end triggers the wheel
-  if (turnsCompleted === 0 && bothTeamsPresent) {
-    console.log('[SNITCH] Both seekers on snitch — wait progress 1/2')
-    return {
-      snitchWaitTurnsCompleted: 1,
-      snitchEncounterPending: true,
-      snitchEncounterDelayTurns: undefined,
-      snitchWheelContext: s.snitchWheelContext ?? 'seeker',
-    }
+  if (s.snitchWaitRequired) {
+    if (s.snitchEncounterPending) return {}
+    return { snitchEncounterPending: true, snitchWheelContext: s.snitchWheelContext ?? 'seeker' }
   }
-
-  if (turnsCompleted !== undefined) return {}
-
-  const initialTurns = bothTeamsPresent ? 1 : 0
-  console.log('[SNITCH] Seekers on snitch — wait timer started (' + initialTurns + '/2 turns)')
+  
   return {
-    snitchWaitTurnsCompleted: initialTurns,
+    snitchWaitRequired: true,
+    // Preserve regular moves already completed during the turn that placed
+    // the Seeker on the Snitch square. The wait becomes active only when the
+    // turn closes, but that completed move still counts for its team.
+    snitchWaitMovesCompleted: getSnitchWaitTeams(s).length,
+    snitchWaitTeams: getSnitchWaitTeams(s),
+    snitchWaitTurnClosed: false,
     snitchEncounterPending: true,
-    snitchEncounterDelayTurns: undefined,
     snitchWheelContext: s.snitchWheelContext ?? 'seeker',
   }
 }
@@ -427,87 +444,119 @@ function applySnitchWaitToState(s: GS): GS {
 
 /**
  * Single authoritative Snitch encounter evaluation — runs after each completed turn.
- * Golden rule: 2 completed turns while seekers wait on the Snitch square.
+ * Golden rule: one regular move by each team while seekers wait on the Snitch square.
  */
 function evaluateSnitchAfterTurnComplete(s: GS): Partial<GS> {
   if (s.snitchPhase !== 'active' || !s.snitchPos) return {}
-
   const seekers = seekersOnSnitch(s.pieces, s.snitchPos)
   if (seekers.length === 0) {
-    if (getSnitchWaitTurnsCompleted(s) !== undefined || s.snitchEncounterPending) {
+    if (getSnitchWaitMovesCompleted(s) !== undefined || s.snitchEncounterPending) {
       return {
         snitchEncounterDelayTurns: undefined,
-        snitchWaitTurnsCompleted: undefined,
+        snitchWaitMovesCompleted: undefined,
+        snitchWaitTeams: undefined,
+        snitchWaitRequired: undefined,
         snitchEncounterPending: false,
       }
     }
     return {}
   }
-
-  let turnsCompleted = getSnitchWaitTurnsCompleted(s)
-
-  if (turnsCompleted === undefined) {
-    console.log('[SNITCH] Turn ended with seekers on snitch — wait timer started (0/2 turns)')
-    return {
-      snitchWaitTurnsCompleted: 0,
-      snitchEncounterPending: true,
-      snitchEncounterDelayTurns: undefined,
-      snitchWheelContext: s.snitchWheelContext ?? 'seeker',
-    }
-  }
-
-  const nextTurns = turnsCompleted + 1
-  if (nextTurns >= 2) {
-    console.log('[SNITCH] Full turn requirement met — triggering encounter wheel')
+  if (isSnitchEncounterReady(s)) {
+    console.log('[SNITCH] Encounter ready — triggering wheel')
     return triggerSnitchEncounterPhase(s)
   }
-
-  console.log('[SNITCH] Snitch wait progress:', nextTurns, '/ 2 completed turns')
+  const movesCompleted = getSnitchWaitMovesCompleted(s) ?? 0
+  console.log('[SNITCH] Seekers waiting on snitch:', movesCompleted, '/ 2 moves')
   return {
-    snitchWaitTurnsCompleted: nextTurns,
     snitchEncounterPending: true,
-    snitchEncounterDelayTurns: undefined,
+    snitchWheelContext: s.snitchWheelContext ?? 'seeker',
   }
 }
 
 function isSnitchEncounterReady(s: GS): boolean {
   if (s.snitchPhase !== 'active' || !s.snitchPos) return false
   if (seekersOnSnitch(s.pieces, s.snitchPos).length === 0) return false
-  const turns = getSnitchWaitTurnsCompleted(s)
-  if (turns === undefined) return false
-  if (turns >= 2) return true
-  // Legacy persisted state: delay=1 means one turn already completed
-  if (s.snitchEncounterDelayTurns === 1 && turns >= 1) return true
-  return false
+  if (hasBlockingBoardAction(s)) return false
+  // A Seeker may still be choosing whether to take its bonus move or end the
+  // turn. Never trigger the Snitch wheel before that choice is closed.
+  if (s.seekerBonusMoveActive || s.snitchWaitTurnClosed !== true) return false
+  
+  // ALWAYS require 2-move wait (first appearance AND reappearance)
+  const waitTeams = getSnitchWaitTeams(s)
+  return waitTeams.includes(1) && waitTeams.includes(2)
 }
 
 function finishMatchTurn(s: GS, pieces: Piece[], progress: ReturnType<typeof progressAfterMove>): GS {
-  const next = { ...s, pieces, ...progress, turn: nextTeam(s.turn) }
-  return { ...next, ...evaluateSnitchAfterTurnComplete(next) }
+  const next = {
+    ...s,
+    pieces,
+    ...progress,
+    turn: nextTeam(s.turn),
+    snitchWaitTurnClosed: s.snitchPhase === 'active' ? true : progress.snitchWaitTurnClosed,
+  }
+  const waiting = { ...next, ...ensureSnitchWaitActive(next) }
+  return { ...waiting, ...evaluateSnitchAfterTurnComplete(waiting) }
 }
 
 function completeTurn(s: GS, patch: Partial<GS>): GS {
-  const next = { ...s, ...patch, revision: bumpRevision(s) }
-  return { ...next, ...evaluateSnitchAfterTurnComplete(next) }
+  const next = {
+    ...s,
+    ...patch,
+    revision: bumpRevision(s),
+    snitchWaitTurnClosed: s.snitchPhase === 'active' ? true : s.snitchWaitTurnClosed,
+  }
+  const waiting = { ...next, ...ensureSnitchWaitActive(next) }
+  return { ...waiting, ...evaluateSnitchAfterTurnComplete(waiting) }
 }
 
-/** Records board-move counters (turn count, snitch spawn, hiding). Snitch encounter timing is handled by evaluateSnitchAfterTurnComplete. */
-function progressAfterMove(s: GS, movedPiece?: Piece) {
+/** Records board-move counters (turn count, snitch spawn, hiding). Also advances snitch wait counter when required. */
+function progressAfterMove(s: GS, movedPiece?: Piece, isRegularMove: boolean = true) {
   // Only increment turnCount if a piece was actually moved (not for bludger hits)
   const incrementTurnCount = movedPiece !== undefined
   const turnCount = incrementTurnCount ? s.turnCount + 1 : s.turnCount
-  const hiddenMoves = s.snitchPhase === 'hiding' && incrementTurnCount ? (s.snitchHiddenMoves ?? 0) + 1 : s.snitchHiddenMoves
+  
+  // regularMoveCount only increments for non-seeker-bonus moves
+  const regularMoveCount = incrementTurnCount && isRegularMove 
+    ? (s.regularMoveCount ?? 0) + 1 
+    : (s.regularMoveCount ?? 0)
+  
+  // Record a team's regular move while a Seeker is on the Snitch square, but
+  // do not activate/evaluate the wait until the current turn has finished.
+  // Seeker bonus moves deliberately do not count.
+  const snitchSquareOccupiedAfterMove = s.snitchPhase === 'active' && s.snitchPos && (
+    seekersOnSnitch(s.pieces, s.snitchPos).length > 0 ||
+    (movedPiece?.type === 'S' && movedPiece.col === s.snitchPos.col && movedPiece.row === s.snitchPos.row)
+  )
+  const snitchWaitTeams = snitchSquareOccupiedAfterMove && incrementTurnCount && isRegularMove && movedPiece
+    ? [...new Set([...getSnitchWaitTeams(s), movedPiece.team])] as Team[]
+    : s.snitchWaitTeams
+  const snitchWaitMovesCompleted = snitchWaitTeams
+    ? snitchWaitTeams.length
+    : s.snitchWaitMovesCompleted
+  const snitchWaitTurnClosed = snitchSquareOccupiedAfterMove && incrementTurnCount && isRegularMove
+    ? false
+    : s.snitchWaitTurnClosed
+  
+  const hiddenMoves = s.snitchPhase === 'hiding' && incrementTurnCount && isRegularMove
+    ? (s.snitchHiddenMoves ?? 0) + 1
+    : s.snitchHiddenMoves
   const snitchReadyToReturn = s.snitchPhase === 'hiding' && hiddenMoves !== undefined && hiddenMoves === 4
 
   console.log('[PROGRESS AFTER MOVE]', {
     incrementTurnCount,
+    isRegularMove,
     previousTurnCount: s.turnCount,
     newTurnCount: turnCount,
+    previousRegularMoveCount: s.regularMoveCount,
+    newRegularMoveCount: regularMoveCount,
+    snitchWaitRequired: s.snitchWaitRequired,
+    previousSnitchWaitMoves: s.snitchWaitMovesCompleted,
+    newSnitchWaitMoves: snitchWaitMovesCompleted,
     snitchPhase: s.snitchPhase,
     snitchHiddenMoves: hiddenMoves,
     snitchReadyToReturn,
     snitchSpawnThreshold: SNITCH_SPAWN_AFTER_MOVES,
-    shouldSpawn: s.snitchPhase === null && turnCount === SNITCH_SPAWN_AFTER_MOVES,
+    shouldSpawn: s.snitchPhase === null && regularMoveCount === SNITCH_SPAWN_AFTER_MOVES,
     movedPiece: movedPiece?.id
   })
 
@@ -515,22 +564,31 @@ function progressAfterMove(s: GS, movedPiece?: Piece) {
     console.log('[PROGRESS AFTER MOVE] Snitch ready to return after exactly 4 hidden moves')
     return {
       turnCount,
+      regularMoveCount,
       snitchHiddenMoves: hiddenMoves,
       snitchPhase: 'encounter' as const,
       snitchPos: s.snitchHiddenSquare || s.snitchPos,
       snitchHiddenSquare: undefined,
       snitchWheelContext: 'return' as const,
+      snitchWaitRequired: true,         // Snitch REappeared, needs 2-move wait
+      snitchWaitMovesCompleted: 0,      // Reset wait counter
+      snitchWaitTeams: [],               // One regular move by each team is required
+      snitchWaitTurnClosed: false,
     }
   }
 
-  const shouldSpawn = s.snitchPhase === null && turnCount === SNITCH_SPAWN_AFTER_MOVES
+  const shouldSpawn = s.snitchPhase === null && regularMoveCount === SNITCH_SPAWN_AFTER_MOVES
   if (shouldSpawn) {
-    console.log('[PROGRESS AFTER MOVE] TRIGGERING SNITCH APPEARANCE at turnCount:', turnCount)
+    console.log('[PROGRESS AFTER MOVE] TRIGGERING SNITCH APPEARANCE at regularMoveCount:', regularMoveCount)
   }
 
   return {
     turnCount,
+    regularMoveCount,
     snitchHiddenMoves: hiddenMoves,
+    snitchWaitMovesCompleted,  // Advance wait counter if applicable
+    snitchWaitTeams,
+    snitchWaitTurnClosed,
     snitchPhase: shouldSpawn ? 'appearing' as const : s.snitchPhase,
   }
 }
@@ -544,6 +602,15 @@ function reduce(s: GS, a: Act): GS {
 
   switch (a.kind) {
     case 'PLACE':
+      // GOALKEEPER LIMIT: Prevent placing more than 1 GK per team
+      if (a.pt === 'GK') {
+        const existingGK = s.pieces.find(p => p.team === a.team && p.type === 'GK')
+        if (existingGK) {
+          console.log('[REDUCER] Blocked duplicate GK placement for team:', a.team)
+          return s  // Already have a GK, reject
+        }
+      }
+      
       console.log('[REDUCER PLACE] Adding piece:', {
         pieceId: a.id,
         team: a.team,
@@ -586,6 +653,32 @@ function reduce(s: GS, a: Act): GS {
     }
 
     case 'MOVE': {
+      // DEPLOYMENT PHASE: Allow repositioning any piece EXCEPT goalkeeper
+      if (s.phase === 'deployment') {
+        const pieceToMove = s.pieces.find(p => p.id === a.pid)
+        if (pieceToMove && pieceToMove.type === 'GK') {
+          console.log('[REDUCER] Blocked deployment reposition for goalkeeper:', a.pid)
+          return s  // Goalkeeper cannot be moved even in deployment
+        }
+        if (!pieceToMove || !deployable(s.pieces, pieceToMove.team, pieceToMove.type).includes(`${a.col}${a.row}`)) {
+          console.log('[REDUCER] Blocked invalid deployment reposition:', a.pid, `${a.col}${a.row}`)
+          return s
+        }
+        // Allow other pieces to be repositioned
+        const pieces = s.pieces.map(p =>
+          p.id === a.pid ? { ...p, col: a.col, row: a.row } : p
+        )
+        console.log('[DEPLOYMENT] Piece repositioned:', { id: a.pid, to: `${a.col}${a.row}` })
+        return { ...s, pieces, revision: bumpRevision(s) }
+      }
+      
+      // MATCH PHASE: GOALKEEPER LOCK - Block any MOVE action for goalkeeper pieces
+      const pieceToMove = s.pieces.find(p => p.id === a.pid)
+      if (pieceToMove && pieceToMove.type === 'GK') {
+        console.log('[REDUCER] Blocked MOVE for goalkeeper:', a.pid)
+        return s  // Reject the move, return unchanged state
+      }
+      
       const pieces = s.pieces.map(p =>
         p.id === a.pid ? { ...p, col: a.col, row: a.row } : p
       )
@@ -599,19 +692,37 @@ function reduce(s: GS, a: Act): GS {
       // Check if this is a seeker move (ANY seeker move, not just during delay)
       const isSeekerMove = moved.type === 'S' && !wasBonusMoveActive
       
-      const moveProgress = progressAfterMove(s, moved)
+      // Regular moves are: non-seeker moves OR seeker's first move (not bonus moves)
+      // Seeker bonus moves do NOT count toward snitch spawn
+      const isRegularMove = !wasBonusMoveActive
+      
+      const moveProgress = progressAfterMove(s, moved, isRegularMove)
 
       const allExceptMoved = pieces.filter(p => p.id !== moved.id)
       
-      // ATTACKER/DEFENDER FIX: Check for defender FIRST before any goal zone logic
-      const defender = allExceptMoved.find(
-        x => x.col === moved.col && x.row === moved.row && x.team !== moved.team && x.type === 'D'
+      // Combat is only for an attacker and defender that started stacked on
+      // the same square and then tried to separate. Moving onto a defender
+      // already occupying another square is not a combat trigger.
+      const defenderAtStart = allExceptMoved.find(
+        x => x.col === pieceToMove?.col && x.row === pieceToMove?.row && x.team !== moved.team && x.type === 'D'
       )
+      const attackerStartedOnDefenderSquare = Boolean(pieceToMove && defenderAtStart)
+      const attackerLeftStartingSquare = Boolean(
+        pieceToMove && (moved.col !== pieceToMove.col || moved.row !== pieceToMove.row),
+      )
+      const shouldTriggerCombat = moved.type === 'A' &&
+        attackerStartedOnDefenderSquare &&
+        attackerLeftStartingSquare
+      const defender = shouldTriggerCombat ? defenderAtStart : undefined
       
       // If attacker moved and there's a defender, trigger combat
       if (defender && moved.type === 'A') {
-        console.log('[ATTACKER MOVE] Defender found, triggering combat')
-        return applySnitchWaitToState({
+        console.log('[ATTACKER MOVE] Defender found, triggering combat', {
+          defenderId: defender.id,
+          location: 'starting square',
+          attemptedDestination: `${moved.col}${moved.row}`,
+        })
+        return {
           ...s, pieces, ...moveProgress,
           seekerBonusMoveActive: false,
           combat: {
@@ -623,18 +734,28 @@ function reduce(s: GS, a: Act): GS {
             defTeam: defender.team,
             phase: 'spinning',
             result: null,
+            // Save the square occupied before the battle move. A failed
+            // attack retreats opposite to the attempted movement.
+            fromCol: pieceToMove?.col,
+            fromRow: pieceToMove?.row,
           },
-        })
+        }
       }
 
         // If attacker reached goal zone WITHOUT defender, trigger choice UI
       if (moved.type === 'A' && triggersShoot(moved) && !defender) {
-        console.log('[ATTACKER MOVE] Reached goal zone without defender, showing choice')
+        console.log('[ATTACKER MOVE] Reached goal zone without defender, showing choice', {
+          pieceId: moved.id,
+          team: moved.team,
+          row: moved.row,
+          type: moved.type,
+          triggersShoot: triggersShoot(moved)
+        })
         // Clear stayedInGoalZone flag if attacker is choosing
         const updatedPieces = pieces.map(p => 
           p.id === moved.id ? { ...p, stayedInGoalZone: false } : p
         )
-        return applySnitchWaitToState({
+        return {
           ...s, 
           pieces: updatedPieces, 
           ...moveProgress,
@@ -642,7 +763,7 @@ function reduce(s: GS, a: Act): GS {
           attackerScoringChoice: moved.id,  // Show STAY / SHOOT choice
           currentActionPlayerId: moved.controllerPlayerId, // Attacker decides
           // Do NOT switch turn yet - wait for user's choice (STAY or SCORE)
-        })
+        }
       }
 
       // Seeker move (first in turn): always offer move-again / end-turn prompt
@@ -652,24 +773,24 @@ function reduce(s: GS, a: Act): GS {
         const updatedPieces = pieces.map(p => 
           p.id === moved.id ? { ...p, disabledUntilTurn: s.turnCount + 1 } : p
         )
-        return applySnitchWaitToState({
+        return {
           ...s,
           pieces: updatedPieces,
           ...moveProgress,
           seekerBonusMoveActive: true,
           revision: bumpRevision(s),
-        })
+        }
       }
 
       // Bonus follow-up move (non-seeker): end turn with normal turn-completion path
       if (wasBonusMoveActive) {
         return completeTurn(
-          applySnitchWaitToState({ ...s, pieces, ...moveProgress }),
+          { ...s, pieces, ...moveProgress },
           { seekerBonusMoveActive: false, turn: nextTeam(s.turn) },
         )
       }
 
-      return { ...finishMatchTurn(s, pieces, moveProgress), ...ensureSnitchWaitActive({ ...s, pieces, ...moveProgress }), revision: bumpRevision(s) }
+      return { ...finishMatchTurn(s, pieces, moveProgress), revision: bumpRevision(s) }
     }
 
     case 'SEEKER_CONTINUE':
@@ -762,9 +883,12 @@ function reduce(s: GS, a: Act): GS {
     }
 
     case 'COMBAT_SPIN': {
-      if (!s.combat) return s
+      // A combat spin is authoritative once. Ignore duplicate broadcasts or
+      // stale timers after the wheel has already started/resolved.
+      if (!s.combat || s.combat.phase !== 'spinning' || s.combat.result !== null) return s
       return {
         ...s,
+        revision: bumpRevision(s),
         combat: { 
           ...s.combat, 
           phase: 'spinning_anim', 
@@ -775,7 +899,9 @@ function reduce(s: GS, a: Act): GS {
     }
 
     case 'COMBAT_RESOLVE': {
-      if (!s.combat || !s.combat.result) return s
+      // Only the completed animation may resolve the combat. This prevents a
+      // duplicate timer/broadcast from resolving the same battle twice.
+      if (!s.combat || s.combat.phase !== 'spinning_anim' || !s.combat.result) return s
       const atk = s.pieces.find(p => p.id === s.combat!.attackerId)!
       const win = s.combat.result === 'win'
 
@@ -823,10 +949,24 @@ function reduce(s: GS, a: Act): GS {
         }
       } else {
         // Attacker LOST - push back and show reveal phase
-        const pushBack = triggersShoot(atk) ? 2 : 1
-        const prevRow = atk.team === 1 ? atk.row + pushBack : atk.row - pushBack
-        const clampedRow = Math.max(1, Math.min(5, prevRow))
-        newPieces = s.pieces.map(p => p.id === atk.id ? { ...p, row: clampedRow } : p)
+        // A failed attack retreats one square opposite to the attempted move.
+        // Example: A3 -> A4 becomes A2 on a loss; A3 -> A2 becomes A4.
+        const fromCol = s.combat.fromCol
+        const fromRow = s.combat.fromRow
+        const rowDelta = fromRow === undefined ? 0 : atk.row - fromRow
+        const colDelta = fromCol === undefined ? 0 : COLS.indexOf(atk.col) - COLS.indexOf(fromCol)
+        // Retreat from the original square, not merely one cell from the
+        // destination. Example: A3 -> A4 becomes A2 on a loss.
+        const retreatRow = rowDelta === 0
+          ? atk.row
+          : Math.max(1, Math.min(5, (fromRow ?? atk.row) - Math.sign(rowDelta)))
+        const retreatCol = colDelta === 0
+          ? atk.col
+          : COLS[Math.max(0, Math.min(COLS.length - 1, COLS.indexOf(fromCol ?? atk.col) - Math.sign(colDelta)))]
+        newPieces = s.pieces.map(p => p.id === atk.id
+          ? { ...p, col: retreatCol, row: retreatRow }
+          : p
+        )
         
         // Show reveal phase with retreat result
         return {
@@ -984,12 +1124,14 @@ function reduce(s: GS, a: Act): GS {
 
     case 'SNITCH_SYNC_WAIT': {
       if (s.snitchPhase !== 'active' || !s.snitchPos) return s
+      if (hasBlockingBoardAction(s)) return s
       if (seekersOnSnitch(s.pieces, s.snitchPos).length === 0) return s
       return applySnitchWaitToState({ ...s, revision: bumpRevision(s) })
     }
 
     case 'SNITCH_TRIGGER_ENCOUNTER': {
       if (s.snitchPhase !== 'active' || !s.snitchPos) return s
+      if (hasBlockingBoardAction(s)) return s
       if (seekersOnSnitch(s.pieces, s.snitchPos).length === 0) return s
       if (!isSnitchEncounterReady(s)) return s
       return { ...s, ...triggerSnitchEncounterPhase(s), revision: bumpRevision(s) }
@@ -1016,29 +1158,33 @@ function reduce(s: GS, a: Act): GS {
       if (s.snitchPhase !== 'spinning' || !s.snitchTarget) return s
       const landingSeekers = seekersOnSnitch(s.pieces, s.snitchTarget)
       
-      // If seekers are already on the landing square, determine delay needed
+      // ALWAYS require 2-move wait before encounter (first appearance AND reappearance)
       if (landingSeekers.length > 0) {
         return {
           ...s,
           snitchPos: s.snitchTarget,
           snitchPhase: 'active',
           snitchEncounterPending: true,
-          snitchWaitTurnsCompleted: 0,
-          snitchEncounterDelayTurns: undefined,
+          snitchWaitRequired: true,
+          snitchWaitMovesCompleted: 0,
+          snitchWaitTeams: [],
           snitchWheelContext: 'seeker',
           snitchRecentSquares: [...(s.snitchRecentSquares ?? []), `${s.snitchTarget.col}${s.snitchTarget.row}`].slice(-3),
           revision: bumpRevision(s),
         }
       }
       
-      // No seekers waiting, just land normally
+      // No seekers waiting, but still set wait requirement
       return {
         ...s,
         snitchPos: s.snitchTarget,
         snitchPhase: 'active',
         snitchEncounterPending: false,
-        snitchEncounterDelayTurns: undefined,
+        snitchWaitRequired: true,
+        snitchWaitMovesCompleted: 0,
+        snitchWaitTeams: [],
         snitchRecentSquares: [...(s.snitchRecentSquares ?? []), `${s.snitchTarget.col}${s.snitchTarget.row}`].slice(-3),
+        revision: bumpRevision(s),
       }
 
     case 'SNITCH_OUTCOME_SPIN': {
@@ -1079,25 +1225,21 @@ function reduce(s: GS, a: Act): GS {
               snitchWheelContext: undefined,
               snitchEventId: eventId,
             }
-          } else if (seekersOnReturn.length === 1) {
-            // Single seeker on return position - they catch the snitch and get 50 points
-            const seeker = seekersOnReturn[0]
-            return {
-              ...s, phase: 'finished', duel: null, combat: null,
-              s1: seeker.team === 1 ? s.s1 + 50 : s.s1,
-              s2: seeker.team === 2 ? s.s2 + 50 : s.s2,
-              snitchPhase: 'caught',
-              snitchCatchWinnerId: seeker.id,
-              snitchEventId: eventId,
-            }
           } else {
-            // Multiple seekers on return position - trigger catch-off wheel based on broom speed
+            // A seeker already occupying the return square must still wait
+            // one completed regular move from each team. Do not award the
+            // catch immediately; the normal encounter wheel decides it.
             return {
               ...s,
-              snitchPhase: 'catching',
-              snitchCatchLabels: undefined,
-              snitchCatchAngle: undefined,
-              snitchCatchWinnerId: undefined,
+              snitchPhase: 'active',
+              snitchPos: returnPos,
+              snitchHiddenMoves: 0,
+              snitchHiddenSquare: undefined,
+              snitchWheelContext: 'seeker',
+              snitchEncounterPending: true,
+              snitchWaitRequired: true,
+              snitchWaitMovesCompleted: 0,
+              snitchWaitTeams: [],
               snitchEventId: eventId,
             }
           }
@@ -1244,13 +1386,17 @@ function reduce(s: GS, a: Act): GS {
                           (incomingRevision === currentRevision && (a.gs.pieces?.length ?? 0) >= s.pieces.length) ||
                           currentRevision === 0
 
+      // A MOVE is saved before COMBAT_SPIN. If that older database snapshot
+      // arrives after the broadcasted spin, do not erase the visible wheel.
+      const staleCombatSnapshot = Boolean(s.combat) && !a.gs.combat && incomingRevision <= currentRevision
+
       // Never revert a completed STAY/SHOOT choice back to the pending choice UI
       const incomingChoiceId = a.gs.attackerScoringChoice
       const stayAlreadyCommitted = incomingChoiceId &&
         !s.attackerScoringChoice &&
         s.pieces.some(p => p.id === incomingChoiceId && p.readyToShoot)
       
-      if (!shouldAccept || stayAlreadyCommitted) {
+      if (!shouldAccept || stayAlreadyCommitted || staleCombatSnapshot) {
         // Incoming state is older, incomplete, or would undo a committed attacker choice
         console.log('[REDUCER SYNC] REJECTED - Older, incomplete, or stale attacker choice')
         return s
@@ -2055,10 +2201,16 @@ function GamePageInner() {
 
   /* ── State ────────────────────────────────────────────────────────────── */
   // Real captain status and team member mappings (declared early for isCaptain)
-  const [dbIsCaptain, setDbIsCaptain] = useState<boolean>(!isSpectator && roomCode.startsWith('SOLO'))
+  // Solo mode detection: Will be updated from DB, default to false for spectators
+  const [isSoloMode, setIsSoloMode] = useState<boolean>(false)
+  const [dbIsCaptain, setDbIsCaptain] = useState<boolean>(false)
   
-  // Captain flag — solo players are always captain; team mode uses dbIsCaptain from DB
-  const isCaptain = dbIsCaptain
+  // Solo mode has no captain concept. Keep the legacy alias for team-mode UI paths.
+  const canControlPieces = isSoloMode || dbIsCaptain
+  const isCaptain = canControlPieces
+  
+  // DEBUG: Log captain status
+  console.log('[CONTROL STATUS]', { mode: isSoloMode ? 'solo' : 'team', canControlPieces, isSpectator, roomCode })
   
   // Initialize game state with starter team from coin flip result and unique match ID
   const [gs, disp]           = useReducer(reduce, undefined, () => ({
@@ -2141,9 +2293,9 @@ function GamePageInner() {
     chRef.current?.send({ type: 'broadcast', event: 'g', payload: a })
 
     // Determine which RPC to use based on action type
-    const captainMovementActions = ['PLACE', 'MOVE', 'ASSIGN_BROOM', 'DDONE']
+    const pieceMovementActions = ['PLACE', 'MOVE', 'ASSIGN_BROOM', 'DDONE']
     const playerActionTypes = ['DUEL', 'ATTACKER_CHOICE', 'ATTACKER_SHOOT']
-    const needsSave = captainMovementActions.includes(a.kind) || playerActionTypes.includes(a.kind) || 
+    const needsSave = pieceMovementActions.includes(a.kind) || playerActionTypes.includes(a.kind) || 
       ['DRESET', 'COMBAT_SPIN', 'COMBAT_RESOLVE', 'COMBAT_REVEAL_COMPLETE', 'END_BONUS_TURN', 'SEEKER_CONTINUE', 
        'SNITCH_SYNC_WAIT', 'SNITCH_TRIGGER_ENCOUNTER', 'SNITCH_OUTCOME_SPIN', 'SNITCH_OUTCOME_RESOLVE', 'SNITCH_LAND'].includes(a.kind)
 
@@ -2155,18 +2307,74 @@ function GamePageInner() {
         let error = null
 
         // Captain-gated movement actions
-        if (captainMovementActions.includes(a.kind)) {
-          const result = await supabase.rpc('move_piece_captain_only', {
+        if (pieceMovementActions.includes(a.kind)) {
+          console.log('[EMIT] Saving piece state:', { action: a.kind, mode: isSoloMode ? 'solo' : 'team' })
+          let result = await supabase.rpc('move_piece_captain_only', {
             p_room_code: roomCode,
             p_expected_revision: expectedRevision,
             p_game_state: nextState,
           })
+          console.log('[EMIT] move_piece_captain_only result:', { success: result.data?.success, error: result.error, hasGameState: !!result.data?.game_state })
           error = result.error
           if (result.data && !result.data.success) {
-            console.error('[EMIT] Captain movement rejected:', result.data.error)
-            // If permission denied, sync with server state
-            if (result.data.conflict && result.data.game_state) {
-              disp({ kind: 'SYNC', gs: result.data.game_state })
+            const rejectionReason = result.data.error ?? (result.data.conflict
+              ? 'Game state changed in the other browser (revision conflict).'
+              : 'Unknown server rejection.')
+            // ALWAYS sync with server state when rejected (not just conflicts)
+            if (result.data.game_state) {
+              let serverState = result.data.game_state as GS
+              disp({ kind: 'SYNC', gs: serverState })
+
+              // A second browser may have committed just before this request.
+              // Rebase the action a few times so simultaneous placement/moves
+              // do not get discarded just because realtime arrived slightly late.
+              for (let attempt = 1; attempt <= 3 && result.data?.conflict; attempt++) {
+                const pieceAlreadyAtTarget = a.kind === 'MOVE' && serverState.pieces.some(piece =>
+                  piece.id === a.pid && piece.col === a.col && piece.row === a.row
+                )
+                if (pieceAlreadyAtTarget) break
+
+                const rebasedState = reduce(serverState, a)
+                if ((rebasedState.revision ?? 0) <= (serverState.revision ?? 0)) break
+
+                await new Promise(resolve => setTimeout(resolve, 150))
+                result = await supabase.rpc('move_piece_captain_only', {
+                  p_room_code: roomCode,
+                  p_expected_revision: serverState.revision ?? 0,
+                  p_game_state: rebasedState,
+                })
+                console.log('[EMIT] Retried captain movement:', {
+                  attempt,
+                  success: result.data?.success,
+                  error: result.error,
+                  conflict: result.data?.conflict,
+                })
+                if (result.data?.success) {
+                  disp({ kind: 'SYNC', gs: { ...rebasedState, revision: result.data.revision } })
+                  break
+                }
+                if (result.data?.game_state) serverState = result.data.game_state as GS
+              }
+
+              if (!result.data?.success) {
+                console.error('[EMIT] Piece-state save failed after retries:', rejectionReason, {
+                  conflict: result.data?.conflict,
+                  serverRevision: result.data?.game_state?.revision,
+                })
+              }
+            } else {
+              console.error('[EMIT] Piece-state save rejected:', rejectionReason)
+              console.log('[EMIT] No game state in rejection, fetching from database')
+              // No game state provided, fetch current state from database
+              const { data: freshState } = await supabase
+                .from('quidditch_game_states')
+                .select('game_state, revision')
+                .eq('room_id', gameStateRoomId ?? '')
+                .single()
+              if (freshState?.game_state) {
+                console.log('[EMIT] Fetched fresh state, syncing')
+                disp({ kind: 'SYNC', gs: { ...freshState.game_state, revision: freshState.revision } })
+              }
             }
           }
         }
@@ -2191,21 +2399,56 @@ function GamePageInner() {
         }
         // Fallback to generic save for other actions
         else {
-          const result = await supabase.rpc('save_quidditch_game_state', {
+          console.log('[EMIT] Calling save_quidditch_game_state for action:', a.kind)
+          let result = await supabase.rpc('save_quidditch_game_state', {
             p_room_code: roomCode,
             p_game_state: nextState,
             p_expected_revision: expectedRevision,
           })
+
+          // Two browser tabs can submit MOVE then COMBAT_SPIN/RESOLVE nearly
+          // simultaneously. Re-read the canonical row and retry the action
+          // against the newest revision instead of losing the wheel state.
+          for (let attempt = 1; attempt <= 5 && result.data?.conflict; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, 150))
+            const { data: latest } = await supabase
+              .from('quidditch_game_states')
+              .select('game_state, revision')
+              .eq('room_id', gameStateRoomId ?? '')
+              .single()
+            if (!latest?.game_state) break
+
+            const serverState = { ...latest.game_state as GS, revision: latest.revision }
+            const rebasedState = reduce(serverState, a)
+            if ((rebasedState.revision ?? 0) <= (serverState.revision ?? 0)) continue
+
+            result = await supabase.rpc('save_quidditch_game_state', {
+              p_room_code: roomCode,
+              p_game_state: rebasedState,
+              p_expected_revision: serverState.revision ?? 0,
+            })
+            console.log('[EMIT] Retried generic action:', {
+              action: a.kind,
+              attempt,
+              success: result.data?.success,
+              conflict: result.data?.conflict,
+            })
+            if (result.data?.success) {
+              disp({ kind: 'SYNC', gs: { ...rebasedState, revision: result.data.revision } })
+              break
+            }
+          }
+          console.log('[EMIT] save_quidditch_game_state result:', { success: result.data?.success, error: result.error })
           error = result.error
         }
 
         if (error) {
-          console.error('[EMIT] Database save failed:', error)
+          console.error('[EMIT] Database save failed:', { error, action: a.kind, errorDetails: JSON.stringify(error) })
           // Silent fail - realtime broadcast handles sync
         }
       })()
     }
-  }, [isSpectator, roomCode, supabase, teamIdentityReady, myTeam])
+  }, [isSpectator, roomCode, supabase, teamIdentityReady, myTeam, isSoloMode, gameStateRoomId])
 
   /* Starter Wheel: DEPRECATED - replaced by coin flip in room lobby */
   // Old wheel code removed - starter is now determined in room lobby
@@ -2229,24 +2472,40 @@ function GamePageInner() {
         .eq('room_code', roomCode)
         .single()
       if (!room || cancelled) return
-      const { data: teams } = await supabase
+      
+      // Set solo mode flag from database
+      if (!cancelled) setIsSoloMode(room.mode === 'solo')
+      
+      const { data: teams} = await supabase
         .from('teams')
         .select('id, team_number, captain_id')
         .eq('room_id', room.id)
-      const membership = teams && (await supabase
-        .from('team_members')
-        .select('team_id')
-        .eq('user_id', user.id)
-        .in('team_id', teams.map(team => team.id))
-        .maybeSingle()).data
-      const verifiedTeam = teams?.find(team => team.id === membership?.team_id)?.team_number
       
-      // Determine if they are actual captain from DB
-      const isActualCaptain = teams?.some(t => t.captain_id === user.id) || room.mode === 'solo'
-      if (!cancelled) setDbIsCaptain(isActualCaptain)
-      
-      if (!cancelled && (verifiedTeam === 1 || verifiedTeam === 2)) setMyTeam(verifiedTeam)
-      if (!cancelled) setTeamIdentityReady(true)
+      // SOLO MODE: Trust URL parameter, skip database verification
+      // (allows one user to test both teams in two tabs)
+      if (room.mode === 'solo') {
+        // In solo mode, everyone is captain
+        if (!cancelled) setDbIsCaptain(true)
+        // Trust the team from URL
+        if (!cancelled) setMyTeam(requestedTeam)
+        if (!cancelled) setTeamIdentityReady(true)
+      } else {
+        // TEAM MODE: Verify from database
+        const membership = teams && (await supabase
+          .from('team_members')
+          .select('team_id')
+          .eq('user_id', user.id)
+          .in('team_id', teams.map(team => team.id))
+          .maybeSingle()).data
+        const verifiedTeam = teams?.find(team => team.id === membership?.team_id)?.team_number
+        
+        // Determine if they are actual captain from DB
+        const isActualCaptain = teams?.some(t => t.captain_id === user.id)
+        if (!cancelled) setDbIsCaptain(isActualCaptain)
+        
+        if (!cancelled && (verifiedTeam === 1 || verifiedTeam === 2)) setMyTeam(verifiedTeam)
+        if (!cancelled) setTeamIdentityReady(true)
+      }
 
       // Fetch ALL team members for piece assignment tracking
       if (teams && !cancelled) {
@@ -2460,7 +2719,7 @@ function GamePageInner() {
         return
       }
       // Wait for combat or duel to finish before triggering Snitch wheel
-      if (live.combat?.phase || live.combat || live.duel?.phase || live.duel) {
+      if (hasBlockingBoardAction(live)) {
         console.log('[SNITCH] Waiting for combat/duel to finish before triggering wheel')
         return
       }
@@ -2512,7 +2771,7 @@ function GamePageInner() {
     // SAFETY FALLBACK: Force transition if stuck in appearing phase for too long
     const safetyT = setTimeout(() => {
       const live = gsRef.current
-      if (live.snitchPhase === 'appearing') {
+      if (live.snitchPhase === 'appearing' && !hasBlockingBoardAction(live)) {
         console.log('[SNITCH] SAFETY: Still in appearing phase, forcing transition')
         // Force a simple wheel with all squares
         const allSquares = shuffleSquares()
@@ -2534,7 +2793,16 @@ function GamePageInner() {
       clearTimeout(t)
       clearTimeout(safetyT)
     }
-  }, [gs.snitchPhase, myTeam, emit])
+  }, [
+    gs.snitchPhase,
+    gs.combat?.phase,
+    gs.duel?.phase,
+    gs.bludger?.phase,
+    gs.seekerBonusMoveActive,
+    gs.attackerScoringChoice,
+    myTeam,
+    emit,
+  ])
 
   // Sync local wheel state when SNITCH_SPIN lands in gs (both teams)
   useEffect(() => {
@@ -2564,7 +2832,7 @@ function GamePageInner() {
   useEffect(() => {
     if (gs.snitchPhase !== 'spinning' || myTeam !== 1) return
     // Wait for combat to finish before proceeding - comprehensive check
-    if (gs.combat?.phase || gs.combat) {
+    if (hasBlockingBoardAction(gs)) {
       console.log('[SNITCH] Waiting for combat to finish before SNITCH_LAND')
       return
     }
@@ -2575,9 +2843,10 @@ function GamePageInner() {
   /* ── Snitch encounter: Team 1 syncs wait state and promotes ready → encounter ── */
   useEffect(() => {
     if (myTeam !== 1 || gs.snitchPhase !== 'active' || !gs.snitchPos) return
+    if (hasBlockingBoardAction(gs)) return
     if (seekersOnSnitch(gs.pieces, gs.snitchPos).length === 0) return
 
-    if (getSnitchWaitTurnsCompleted(gs) === undefined) {
+    if (getSnitchWaitMovesCompleted(gs) === undefined) {
       emit({ kind: 'SNITCH_SYNC_WAIT' })
       return
     }
@@ -2586,7 +2855,7 @@ function GamePageInner() {
       console.log('[SNITCH] Wait requirement satisfied — triggering encounter phase')
       emit({ kind: 'SNITCH_TRIGGER_ENCOUNTER' })
     }
-  }, [gs.snitchPhase, gs.snitchWaitTurnsCompleted, gs.snitchEncounterDelayTurns, gs.pieces, gs.snitchPos, myTeam, emit])
+  }, [gs.snitchPhase, gs.snitchWaitMovesCompleted, gs.snitchEncounterDelayTurns, gs.pieces, gs.snitchPos, myTeam, emit])
 
   /* ── Snitch fate wheel: Team 1 hosts authoritative spin when encounter phase is set ── */
   useEffect(() => {
@@ -2595,12 +2864,14 @@ function GamePageInner() {
     if (myTeam !== 1) return
 
     const current = gsRef.current
+    if (hasBlockingBoardAction(current)) return
     if (!current.snitchPos || (current.snitchWheelContext !== 'return' && seekersOnSnitch(current.pieces, current.snitchPos).length === 0)) return
 
     console.log('[SNITCH] Encounter phase confirmed — scheduling authoritative wheel spin')
     const t = setTimeout(() => {
       const live = gsRef.current
       if (live.snitchPhase !== 'encounter' || live.snitchOutcomeAngle !== undefined) return
+      if (hasBlockingBoardAction(live)) return
       if (!live.snitchPos || (live.snitchWheelContext !== 'return' && seekersOnSnitch(live.pieces, live.snitchPos).length === 0)) return
 
       const { labels, outcomes } = shuffleOutcomes(live.snitchWheelContext)
@@ -2623,7 +2894,7 @@ function GamePageInner() {
   useEffect(() => {
     if (gs.snitchPhase !== 'encounter' || gs.snitchOutcomeAngle === undefined || myTeam !== 1) return
     // Wait for combat to finish before proceeding - comprehensive check
-    if (gs.combat?.phase || gs.combat) {
+    if (hasBlockingBoardAction(gs)) {
       console.log('[SNITCH] Waiting for combat to finish before SNITCH_OUTCOME_RESOLVE')
       return
     }
@@ -2658,6 +2929,7 @@ function GamePageInner() {
   /* A held Snitch shared by both Seekers gets a speed-weighted catch wheel. */
   useEffect(() => {
     if (gs.snitchPhase !== 'catching' || gs.snitchCatchAngle !== undefined || myTeam !== 1) return
+    if (hasBlockingBoardAction(gs)) return
     const t = setTimeout(() => {
       const contenders = seekersOnSnitch(gsRef.current.pieces, gsRef.current.snitchPos)
       const slots = contenders.flatMap(piece =>
@@ -2860,30 +3132,40 @@ function GamePageInner() {
     let cancelled = false
     void supabase.rpc('get_or_create_quidditch_game_state', {
       p_room_code: roomCode,
-      p_initial_state: initGS(`room-${roomCode}`), // Use room code for consistent matchId
+      p_initial_state: {
+        ...initGS(`room-${roomCode}`),
+        // The lobby coin flip is authoritative for the first turn.
+        turn: starterTeam,
+        coinFlipResult: starterTeam,
+      },
     }).then(({ data, error }) => {
       if (cancelled || error || !data?.success) {
         // Silent fail - game will sync from other players
         return
       }
       const loadedState = data.game_state as GS
+      // Repair an untouched board created by an older build that defaulted to
+      // Team 1. Once deployment/match moves exist, the persisted state wins.
+      const canonicalState = loadedState.phase === 'deployment' && loadedState.turnCount === 0
+        ? { ...loadedState, turn: starterTeam as Team, coinFlipResult: starterTeam as Team }
+        : loadedState
       console.log('[INITIAL LOAD] Game state loaded:', {
-        phase: loadedState.phase,
-        piecesCount: loadedState.pieces.length,
-        turn: loadedState.turn,
-        seekerBonusMoveActive: loadedState.seekerBonusMoveActive,
-        revision: loadedState.revision,
-        matchId: loadedState.matchId,
+        phase: canonicalState.phase,
+        piecesCount: canonicalState.pieces.length,
+        turn: canonicalState.turn,
+        seekerBonusMoveActive: canonicalState.seekerBonusMoveActive,
+        revision: canonicalState.revision,
+        matchId: canonicalState.matchId,
         timestamp: Date.now()
       })
       setGameStateRoomId(data.room_id)
       // Force fresh state - always accept the loaded state
-      disp({ kind: 'SYNC', gs: loadedState })
+      disp({ kind: 'SYNC', gs: canonicalState })
       setSyncReceived(true)
       syncRcvRef.current = true
     })
     return () => { cancelled = true }
-  }, [roomCode, supabase])
+  }, [roomCode, starterTeam, supabase])
 
   /* ── Supabase Realtime ────────────────────────────────────────────────── */
   useEffect(() => {
@@ -2931,6 +3213,16 @@ function GamePageInner() {
       }
       
       console.log('[REALTIME] Applying action from', 'team' in payload ? `team ${payload.team}` : 'system')
+      
+      // GOALKEEPER LOCK: Validate received MOVE actions before applying
+      if (payload.kind === 'MOVE') {
+        const pieceToMove = gsRef.current.pieces.find(p => p.id === (payload as any).pid)
+        if (pieceToMove && pieceToMove.type === 'GK') {
+          console.log('[REALTIME] Blocked MOVE for goalkeeper from broadcast:', (payload as any).pid)
+          return  // Reject goalkeeper move from other browser
+        }
+      }
+      
       // Apply other player's action (or all actions if spectator)
       disp(payload as Act)
     })
@@ -2955,10 +3247,12 @@ function GamePageInner() {
 
     chan.subscribe(async (status) => {
       if (status === 'SUBSCRIBED') {
-        // Request initial state
+        // Request a canonical state after the channel is live. Spectators must
+        // always do this: their initial database read can finish just before
+        // a move and before the realtime subscription is attached.
         for (let i = 0; i < 2; i++) {
-          await new Promise<void>(r => setTimeout(r, 600))
-          if (syncRcvRef.current) break
+          await new Promise<void>(r => setTimeout(r, isSpectator ? 150 : 600))
+          if (!isSpectator && syncRcvRef.current) break
           chan.send({ type: 'broadcast', event: 'g', payload: { kind: 'REQ' } })
         }
       }
@@ -2967,7 +3261,7 @@ function GamePageInner() {
     return () => { 
       supabase.removeChannel(chan) 
     }
-  }, [roomCode, gameStateRoomId, myTeam, supabase])
+  }, [roomCode, gameStateRoomId, myTeam, isSpectator, supabase])
 
   /* ── Connection Health Monitor (DISABLED FOR PERFORMANCE) ─────────────── */
   // Heavy monitoring disabled - game works without it
@@ -2986,19 +3280,17 @@ function GamePageInner() {
   }, [lastSyncTime, myTeam, reconnectAttempts])
   */
 
-  /* ── Auto-reconnect on visibility change (DISABLED FOR PERFORMANCE) ───── */
-  // Disabled - adds overhead, game syncs automatically via broadcast
-  /*
+  /* ── Auto-reconnect on visibility change ──────────────────────────── */
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        chRef.current?.send({ type: 'broadcast', event: 'g', payload: { kind: 'REQ' } })
+      if (document.visibilityState === 'visible' && chRef.current) {
+        // Request a fresh state sync when the tab becomes visible again
+        chRef.current.send({ type: 'broadcast', event: 'g', payload: { kind: 'REQ' } })
       }
     }
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
-  }, [myTeam])
-  */
+  }, [])
 
   /* ── Keyboard navigation - Escape to deselect ─────────────────────────── */
   useEffect(() => {
@@ -3174,9 +3466,15 @@ function GamePageInner() {
   const iAmAttacker  = duelAtk?.team === myTeam
   const iAmCombatAtk = combatAtk?.team === myTeam
   
-  // For duel UI: Only show controls if you're the designated action player
-  const canChooseDuel = gs.duel?.phase === 'choosing' && (iAmAttackerController || iAmKeeperController)
-  const myDuelRole = iAmAttackerController ? 'attacker' : iAmKeeperController ? 'keeper' : null
+  // For duel UI: Show controls if you're the controller OR if you own the piece's team (solo mode)
+  const iAmAttackerTeam = duelAtk?.team === myTeam
+  const iAmKeeperTeam = duelGkPiece?.team === myTeam
+  const canChooseDuel = gs.duel?.phase === 'choosing' && (
+    iAmAttackerController || iAmKeeperController ||  // Team mode: controller only
+    iAmAttackerTeam || iAmKeeperTeam                 // Solo mode: team ownership
+  )
+  const myDuelRole = (iAmAttackerController || iAmAttackerTeam) ? 'attacker' : 
+                     (iAmKeeperController || iAmKeeperTeam) ? 'keeper' : null
 
   // Derive myChoice purely from gs to prevent sync overwrites causing stuck states
   const myChoice     = gs.duel ? (myTeam === 1 ? gs.duel.t1Choice : gs.duel.t2Choice) : null
@@ -3185,7 +3483,12 @@ function GamePageInner() {
   /* ── Handlers ─────────────────────────────────────────────────────────── */
   function clickPiece(p: Piece) {
     if (isSpectator || !teamIdentityReady) return
-    if (gs.duel || gs.combat || gs.bludger || gs.phase !== 'match') return
+    
+    // Allow clicking during deployment OR match phase (block finished)
+    if (gs.phase === 'finished') return
+    
+    // During match, block if duel/combat/bludger active
+    if (gs.phase === 'match' && (gs.duel || gs.combat || gs.bludger)) return
     
     // CRITICAL: Block all piece selection while attacker scoring choice UI is shown
     if (gs.attackerScoringChoice) {
@@ -3200,11 +3503,25 @@ function GamePageInner() {
       }
       return
     }
-    if (p.team !== myTeam || gs.turn !== myTeam) return
-    if ((p.disabledUntilTurn ?? -1) >= gs.turnCount) return
     
-    // Only captain can select and move pieces
-    if (!isCaptain) {
+    // During MATCH phase, enforce turn restrictions
+    if (gs.phase === 'match') {
+      if (p.team !== myTeam || gs.turn !== myTeam) return
+      if ((p.disabledUntilTurn ?? -1) >= gs.turnCount) return
+    }
+    
+    // During DEPLOYMENT phase, only allow own team pieces
+    if (gs.phase === 'deployment' && p.team !== myTeam) return
+    if (gs.phase === 'deployment' && myDone) return
+    
+    // GOALKEEPER RULE: Goalkeepers cannot be selected/moved at all
+    if (p.type === 'GK') {
+      console.log('[CLICK PIECE] Goalkeeper cannot move')
+      return
+    }
+    
+    // Team mode only: check captain status (skip in solo mode where everyone is captain)
+    if (!isSoloMode && !isCaptain && teamIdentityReady) {
       console.log('[CLICK PIECE] Non-captain cannot select pieces for movement')
       return
     }
@@ -3233,15 +3550,26 @@ function GamePageInner() {
     if (selId === p.id) { setSel(null); setMoves(new Set()); setBludgerMode(null); return }
     setBludgerMode(null)
     setSel(p.id)
-    setMoves(new Set(movable(gs.pieces, p)))
+    setMoves(new Set(movable(gs.pieces, p, gs.phase)))
   }
 
   function clickCell(col: Col, row: number) {
     if (isSpectator) return
     const k = `${col}${row}`
+    if (gs.phase === 'deployment' && !myDone && selId && moves.has(k)) {
+      // Reposition an already placed non-goalkeeper during deployment.
+      if (!isSoloMode && !isCaptain) {
+        console.log('[DEPLOY MOVE] Non-captain cannot reposition pieces')
+        return
+      }
+      emit({ kind: 'MOVE', pid: selId, col, row })
+      setMoves(new Set())
+      setSel(null)
+      return
+    }
     if (gs.phase === 'deployment' && !myDone && dpType && deployable(gs.pieces, myTeam, dpType).includes(k)) {
-      // Only captain can place pieces
-      if (!isCaptain) {
+      // Team mode only: check captain status (skip in solo mode)
+      if (!isSoloMode && !isCaptain) {
         console.log('[DEPLOY] Non-captain cannot place pieces')
         return
       }
@@ -3266,8 +3594,8 @@ function GamePageInner() {
       return
     }
     if (gs.phase === 'match' && selId && moves.has(k)) {
-      // Only captain can move pieces during match
-      if (!isCaptain) {
+      // Team mode only: check captain status (skip in solo mode)
+      if (!isSoloMode && !isCaptain) {
         console.log('[MOVE] Non-captain cannot move pieces')
         return
       }
@@ -3550,16 +3878,44 @@ function GamePageInner() {
               className="relative flex flex-col h-full w-full items-center justify-center transform transition-all duration-300 ease-out hover:scale-110 focus:outline-none focus:ring-2 focus:ring-amber-400 rounded"
               onClick={e => {
                 e.stopPropagation()
+                
+                // GOALKEEPER LOCK: GK cannot be clicked/repositioned at ANY time
+                if (piece.type === 'GK') {
+                  console.log('[PIECE CLICK] Goalkeeper is locked and cannot be moved', {
+                    phase: gs.phase,
+                    team: piece.team,
+                    myTeam: myTeam,
+                    pieceId: piece.id
+                  })
+                  return
+                }
+                
                 // Every piece owns a separate side-by-side slot, including five-piece cells.
                 if (vMove || vDep) clickCell(col, row)
-                else clickPiece(piece)
+                else {
+                  clickPiece(piece)
+                }
               }}
               onKeyDown={e => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault()
                   e.stopPropagation()
+                  
+                  // GOALKEEPER LOCK: GK cannot be clicked/repositioned at ANY time
+                  if (piece.type === 'GK') {
+                    console.log('[PIECE CLICK] Goalkeeper is locked and cannot be moved', {
+                      phase: gs.phase,
+                      team: piece.team,
+                      myTeam: myTeam,
+                      pieceId: piece.id
+                    })
+                    return
+                  }
+                  
                   if (vMove || vDep) clickCell(col, row)
-                  else clickPiece(piece)
+                  else {
+                    clickPiece(piece)
+                  }
                 }
               }}
               tabIndex={0}
@@ -3687,12 +4043,46 @@ function GamePageInner() {
         {gs.combat && (gs.combat.phase === 'spinning' || gs.combat.phase === 'spinning_anim') && (
           <span className="text-orange-400 font-bold animate-pulse">⚔️ COMBAT! — Team {gs.combat.atkTeam} vs Team {gs.combat.defTeam}</span>
         )}
+        {/* DEBUG: Always log current state */}
+        {(() => {
+          console.log('[UI RENDER]', {
+            phase: gs.phase,
+            turn: gs.turn,
+            myTeam,
+            hasAttackerScoringChoice: !!gs.attackerScoringChoice,
+            attackerScoringChoice: gs.attackerScoringChoice,
+            hasCombat: !!gs.combat,
+            hasDuel: !!gs.duel
+          })
+          return null
+        })()}
         {gs.attackerScoringChoice && (() => {
           const atk = gs.pieces.find(p => p.id === gs.attackerScoringChoice)
           const iAmAttackerController = atk?.controllerPlayerId === currentUserId
           
-          // Show controls only to the attacker controller
-          if (iAmAttackerController) {
+          console.log('[ATTACKER CHOICE UI]', {
+            attackerScoringChoice: gs.attackerScoringChoice,
+            attackerPiece: atk,
+            controllerPlayerId: atk?.controllerPlayerId,
+            currentUserId,
+            iAmAttackerController,
+            isCaptain,
+            myTeam,
+            attackerTeam: atk?.team
+          })
+          
+          // SIMPLE LOGIC: If attacker is on your team, you see buttons
+          // This works for both solo (one player per team) and team mode
+          const shouldShowControls = (atk?.team === myTeam)
+          
+          console.log('[ATTACKER CHOICE UI] shouldShowControls:', shouldShowControls, {
+            attackerTeam: atk?.team,
+            myTeam,
+            isMyTeam: atk?.team === myTeam
+          })
+          
+          // Show controls to the attacker controller OR captain in solo mode
+          if (shouldShowControls) {
             return (
               <div className="flex flex-col items-center gap-2 animate-in fade-in slide-in-from-top-4 duration-300">
                 <span className="text-amber-400 font-bold text-sm">
@@ -3728,24 +4118,19 @@ function GamePageInner() {
                 </div>
               </div>
             )
-          } else if (atk && atk.team === myTeam) {
-            // Show waiting message to other team members
-            const controllerName = teamMembersData.find(m => m.userId === atk.controllerPlayerId)?.username || 'player'
-            return (
-              <div className="flex flex-col items-center gap-2 animate-in fade-in slide-in-from-top-4 duration-300">
-                <span className="text-slate-400 font-bold text-sm animate-pulse">
-                  ⏳ Waiting for {controllerName} to choose...
-                </span>
-              </div>
-            )
           }
+          // No waiting message - if you don't see buttons, it's not your team
           return null
         })()}
         {selId && (() => {
           const selectedPiece = gs.pieces.find(p => p.id === selId)
           const iAmPieceController = selectedPiece?.controllerPlayerId === currentUserId
           
-          return selectedPiece && selectedPiece.readyToShoot && iAmPieceController && gs.turn === myTeam && (
+          // SIMPLE LOGIC: If piece is on your team and ready to shoot, show button
+          const canShoot = selectedPiece && selectedPiece.readyToShoot && 
+                          gs.turn === myTeam && selectedPiece.team === myTeam
+          
+          return canShoot && (
             <div className="flex flex-col items-center gap-2 animate-in fade-in slide-in-from-top-4 duration-300">
               <span className="text-amber-400 font-bold text-sm">
                 ⚽ READY TO SHOOT!
@@ -3768,7 +4153,7 @@ function GamePageInner() {
       {selectedDefenderCanBludger && !gs.bludger && (
         <div className="relative z-20 shrink-0 flex justify-center gap-2 bg-black/35 px-4 py-2">
           <button
-            onClick={() => { setBludgerMode(null); setMoves(new Set(movable(gs.pieces, selectedPiece))) }}
+            onClick={() => { setBludgerMode(null); setMoves(new Set(movable(gs.pieces, selectedPiece, gs.phase))) }}
             className="rounded-lg border border-slate-500/60 bg-slate-900/80 px-4 py-2 text-xs font-black text-slate-200 hover:bg-slate-800"
           >MOVE</button>
           <button
@@ -4226,15 +4611,15 @@ function GamePageInner() {
                   </>
                 ) : (
                   <>
-                    {/* Waiting message for other players */}
+                    {/* Solo mode: This should never show since both players have controls
+                        Team mode: Waiting message for spectators or other team members */}
                     <p className="text-base mb-8 font-semibold text-slate-400">
                       {iAmAttacker ? '⏳ Your attacker is choosing...' : '⏳ Your goalkeeper is choosing...'}
                     </p>
                     <div className="py-10 text-slate-500">
                       <div className="text-5xl mb-3 animate-pulse">⏳</div>
-                      <p className="text-lg">Waiting for {duelAtk && teamMembersData.find(m => m.userId === duelAtk.controllerPlayerId)?.username || 'player'} 
-                        {' '}and {duelGkPiece && teamMembersData.find(m => m.userId === duelGkPiece.controllerPlayerId)?.username || 'goalkeeper'}...</p>
-                      <p className="text-sm mt-4 animate-pulse">They are making their choices</p>
+                      <p className="text-lg">Duel in progress...</p>
+                      <p className="text-sm mt-4 animate-pulse">Players are making their choices</p>
                     </div>
                   </>
                 )}
@@ -4246,7 +4631,7 @@ function GamePageInner() {
                   <>
                     <div className="text-9xl mb-3 animate-bounce">⚽</div>
                     <h2 className="text-7xl font-black mb-4" style={{ color: '#fbbf24', textShadow: '0 0 60px rgba(251,191,36,0.9), 0 0 120px rgba(251,191,36,0.4)' }}>GOAL!</h2>
-                    <p className="text-4xl font-black text-emerald-400 mb-2">+{gs.streakBonusTeam ? 30 : 10} POINTS</p>
+                    <p className="text-4xl font-black text-emerald-400 mb-2">+{gs.streakBonusTeam ? 20 : 10} POINTS</p>
                     {gs.streakBonusTeam && (
                       <div className="mt-3 animate-bounce rounded-2xl border border-amber-200/80 bg-amber-400/15 px-5 py-3 text-2xl font-black text-amber-200 shadow-[0_0_32px_rgba(251,191,36,0.65)]">
                         GOAL STREAK! +20 BONUS

@@ -33,7 +33,7 @@ $$;
 
 DROP TRIGGER IF EXISTS enforce_position_limits ON team_members;
 CREATE TRIGGER enforce_position_limits
-  BEFORE INSERT OR UPDATE OF position ON team_members
+  BEFORE INSERT OR UPDATE OF "position" ON team_members
   FOR EACH ROW EXECUTE FUNCTION enforce_team_position_limits();
 
 -- The legacy RPC returned JSON. PostgreSQL cannot change a function return

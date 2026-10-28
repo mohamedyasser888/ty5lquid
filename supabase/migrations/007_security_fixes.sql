@@ -206,12 +206,12 @@ CREATE POLICY "Room creator can manage team memberships"
 -- ============================================
 
 -- Drop existing functions if they exist
-DROP FUNCTION IF EXISTS claim_position(team_id UUID, user_id UUID, position TEXT);
+DROP FUNCTION IF EXISTS claim_position(team_id UUID, user_id UUID, "position" TEXT);
 DROP FUNCTION IF EXISTS check_team_capacity(team_id UUID);
 
 -- Create function to check position limits
-CREATE OR REPLACE FUNCTION check_position_limits(team_id UUID, position TEXT)
-RETURNS BOOLEAN AS $$
+CREATE OR REPLACE FUNCTION check_position_limits()
+RETURNS TRIGGER AS $$
 DECLARE
   position_count INTEGER;
   max_allowed INTEGER;
@@ -219,11 +219,11 @@ BEGIN
   -- Count current members with this position
   SELECT COUNT(*) INTO position_count
   FROM team_members
-  WHERE team_id = check_position_limits.team_id
-    AND position = check_position_limits.position;
+  WHERE team_id = NEW.team_id
+    AND "position" = NEW."position";
 
   -- Define limits based on position
-  CASE position
+  CASE NEW."position"
     WHEN 'keeper' THEN max_allowed := 1;
     WHEN 'seeker' THEN max_allowed := 1;
     WHEN 'beater' THEN max_allowed := 2;
@@ -231,21 +231,29 @@ BEGIN
     ELSE max_allowed := 0;
   END CASE;
 
-  RETURN position_count < max_allowed;
+  IF position_count >= max_allowed THEN
+    RAISE EXCEPTION 'Position limit exceeded for %', NEW."position";
+  END IF;
+  
+  RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 -- Create function to check total team capacity
-CREATE OR REPLACE FUNCTION check_team_capacity(team_id UUID)
-RETURNS BOOLEAN AS $$
+CREATE OR REPLACE FUNCTION check_team_capacity()
+RETURNS TRIGGER AS $$
 DECLARE
   team_count INTEGER;
 BEGIN
   SELECT COUNT(*) INTO team_count
   FROM team_members
-  WHERE team_id = check_team_capacity.team_id;
+  WHERE team_id = NEW.team_id;
 
-  RETURN team_count < 7;
+  IF team_count >= 7 THEN
+    RAISE EXCEPTION 'Team capacity exceeded';
+  END IF;
+  
+  RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -259,15 +267,15 @@ DROP TRIGGER IF EXISTS enforce_team_capacity ON team_members;
 
 -- Create trigger to enforce position limits
 CREATE TRIGGER enforce_position_limits
-  BEFORE INSERT OR UPDATE OF position ON team_members
+  BEFORE INSERT OR UPDATE OF "position" ON team_members
   FOR EACH ROW
-  EXECUTE FUNCTION check_position_limits(NEW.team_id, NEW.position);
+  EXECUTE FUNCTION check_position_limits();
 
 -- Create trigger to enforce team capacity
 CREATE TRIGGER enforce_team_capacity
   BEFORE INSERT ON team_members
   FOR EACH ROW
-  EXECUTE FUNCTION check_team_capacity(NEW.team_id);
+  EXECUTE FUNCTION check_team_capacity();
 
 -- ============================================
 -- CAPTAIN SECURITY

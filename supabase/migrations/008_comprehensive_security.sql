@@ -1,4 +1,4 @@
-﻿-- Comprehensive Security Migration
+-- Comprehensive Security Migration
 
 -- 1. PROFILES
 DROP POLICY IF EXISTS "Anyone can view profiles" ON profiles;
@@ -189,7 +189,7 @@ DROP TRIGGER IF EXISTS enforce_position_limits ON team_members;
 DROP TRIGGER IF EXISTS enforce_team_capacity ON team_members;
 
 CREATE OR REPLACE FUNCTION check_position_limits()
-RETURNS TRIGGER AS 
+RETURNS TRIGGER AS $$
 DECLARE
   position_count INTEGER;
   max_allowed INTEGER;
@@ -197,10 +197,10 @@ BEGIN
   SELECT COUNT(*) INTO position_count
   FROM team_members
   WHERE team_id = NEW.team_id
-    AND position = NEW.position
+    AND "position" = NEW."position"
     AND id != COALESCE(NEW.id, '00000000-0000-0000-0000-000000000000'::uuid);
 
-  CASE NEW.position
+  CASE NEW."position"
     WHEN 'keeper' THEN max_allowed := 1;
     WHEN 'seeker' THEN max_allowed := 1;
     WHEN 'beater' THEN max_allowed := 2;
@@ -209,15 +209,15 @@ BEGIN
   END CASE;
 
   IF position_count >= max_allowed THEN
-    RAISE EXCEPTION 'Maximum limit reached for position %', NEW.position;
+    RAISE EXCEPTION 'Maximum limit reached for position %', NEW."position";
   END IF;
 
   RETURN NEW;
 END;
- LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION check_team_capacity()
-RETURNS TRIGGER AS 
+RETURNS TRIGGER AS $$
 DECLARE
   team_count INTEGER;
 BEGIN
@@ -232,10 +232,10 @@ BEGIN
 
   RETURN NEW;
 END;
- LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 CREATE TRIGGER enforce_position_limits
-  BEFORE INSERT OR UPDATE OF position ON team_members
+  BEFORE INSERT OR UPDATE OF "position" ON team_members
   FOR EACH ROW
   EXECUTE FUNCTION check_position_limits();
 

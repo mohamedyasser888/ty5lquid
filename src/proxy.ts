@@ -27,9 +27,8 @@ export async function proxy(request: NextRequest) {
     }
   )
 
-  // This is a navigation convenience only: Supabase RLS protects every data
-  // request. Reading the stored session avoids a network validation request
-  // on every page change, especially immediately after sign-in.
+  // Use the stored session for fast route navigation. Supabase RLS remains
+  // responsible for protecting database operations.
   const {
     data: { session },
   } = await supabase.auth.getSession()
@@ -45,16 +44,9 @@ export async function proxy(request: NextRequest) {
     return NextResponse.redirect(url)
   }
 
-  // Redirect logged-in users away from auth pages
-  const authPaths = ['/login', '/register']
-  const isAuthPath = authPaths.some(path => request.nextUrl.pathname.startsWith(path))
-
-  if (isAuthPath && isAuthenticated) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/home'
-    return NextResponse.redirect(url)
-  }
-
+  // Keep auth pages reachable even when a stale session exists. This lets a
+  // user sign in as a different account instead of getting trapped in a
+  // /login -> /home -> /login redirect loop.
   return supabaseResponse
 }
 

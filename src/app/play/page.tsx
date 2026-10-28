@@ -23,6 +23,7 @@ export default function PlayPage() {
   const [spectatorCode, setSpectatorCode] = useState('')
   const [spectatorError, setSpectatorError] = useState('')
   const [watching, setWatching] = useState(false)
+  const [teamComingSoon, setTeamComingSoon] = useState(false)
 
   const supabase = createClient()
 
@@ -65,7 +66,7 @@ export default function PlayPage() {
   }
 
   const handleTeam = () => {
-    router.push('/room/create?solo=false')
+    setTeamComingSoon(true)
   }
 
   const handleSpectate = async (event: React.FormEvent) => {
@@ -189,6 +190,52 @@ export default function PlayPage() {
           </MagicalCard>
         </div>
       </div>
+
+      {teamComingSoon && (
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/85 px-4 backdrop-blur-md"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="team-coming-soon-title"
+          onClick={() => setTeamComingSoon(false)}
+        >
+          <div
+            className="relative w-full max-w-lg overflow-hidden rounded-3xl border border-amber-300/40 bg-gradient-to-br from-slate-950 via-[#111b3d] to-purple-950/80 p-8 text-center shadow-[0_0_80px_rgba(168,85,247,0.35)] animate-in fade-in zoom-in duration-300"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="pointer-events-none absolute -left-16 -top-16 h-40 w-40 rounded-full bg-purple-500/20 blur-3xl animate-pulse" />
+            <div className="pointer-events-none absolute -bottom-20 -right-10 h-48 w-48 rounded-full bg-amber-400/20 blur-3xl animate-pulse" />
+            <div className="relative">
+              <div className="mx-auto mb-5 flex h-20 w-20 items-center justify-center rounded-full border border-amber-200/50 bg-gradient-to-br from-purple-500 to-amber-400 text-4xl shadow-[0_0_35px_rgba(251,191,36,0.45)] animate-bounce">
+                ⚡
+              </div>
+              <p className="mb-2 text-xs font-black tracking-[0.3em] text-amber-300">THE NEXT MATCH FORMAT</p>
+              <h2 id="team-coming-soon-title" className="mb-3 text-4xl font-black text-white">
+                Team Mode is Coming Soon
+              </h2>
+              <p className="mx-auto max-w-md text-base leading-7 text-slate-300">
+                Assemble your full squad, choose your position, and play together in the next magical release.
+              </p>
+              <div className="my-7 flex items-center justify-center gap-2" aria-hidden="true">
+                {[0, 1, 2, 3, 4].map(index => (
+                  <span
+                    key={index}
+                    className="h-2 w-2 rounded-full bg-amber-300 shadow-[0_0_12px_rgba(253,224,71,0.8)] animate-pulse"
+                    style={{ animationDelay: `${index * 140}ms` }}
+                  />
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => setTeamComingSoon(false)}
+                className="rounded-xl border border-amber-200/50 bg-amber-400 px-8 py-3 font-black text-slate-950 shadow-[0_0_25px_rgba(251,191,36,0.3)] transition hover:-translate-y-0.5 hover:bg-amber-300"
+              >
+                Continue Solo
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </MagicalBackground>
   )
 }

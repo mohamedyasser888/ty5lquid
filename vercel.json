@@ -8,13 +8,11 @@
   "installCommand": "npm ci --prefer-offline --no-audit",
   "framework": "nextjs",
   "env": {
-    "NEXT_TELEMETRY_DISABLED": "1",
-    "BUILD_TIMESTAMP": "@now"
+    "NEXT_TELEMETRY_DISABLED": "1"
   },
   "build": {
     "env": {
-      "NEXT_TELEMETRY_DISABLED": "1",
-      "BUILD_TIMESTAMP": "@now"
+      "NEXT_TELEMETRY_DISABLED": "1"
     }
   },
   "headers": [

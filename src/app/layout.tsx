@@ -3,6 +3,8 @@ import DeviceInfo from "@/components/ui/DeviceInfo";
 import PerformanceTracker from "@/components/PerformanceTracker";
 import "./globals.css";
 
+const GAME_VERSION = '3.3';
+
 export const metadata: Metadata = {
   title: "Quidditch Academy - Magical Sports Game",
   description: "Enter the wizarding world of Quidditch. Play solo or team matches, unlock achievements, and compete with wizards worldwide.",
@@ -38,14 +40,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         {/* Preconnect - Establish connections early */}
         <link rel="preconnect" href="https://supabase.co" crossOrigin="anonymous" />
         
-        {/* Preload Critical Assets */}
-        <link rel="preload" href="/quid.webp" as="image" type="image/webp" />
-        <link rel="preload" href="/snitch.webp" as="image" type="image/webp" />
       </head>
       <body className="min-h-full flex flex-col">
         <PerformanceTracker />
         <DeviceInfo />
         {children}
+        <div className="fixed bottom-1 right-2 z-[100] rounded-md border border-amber-300/30 bg-slate-950/80 px-2 py-0.5 text-[10px] font-black tracking-wider text-amber-200/80 shadow-lg">
+          v{GAME_VERSION}
+        </div>
       </body>
     </html>
   );

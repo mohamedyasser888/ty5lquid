@@ -66,16 +66,6 @@ const nextConfig: NextConfig = {
           }
         ]
       },
-      // JavaScript bundles caching
-      {
-        source: '/_next/static/:path*',
-        headers: [
-          {
-            key: 'Cache-Control',
-            value: 'public, max-age=31536000, immutable'
-          }
-        ]
-      },
       // Game page - no cache to prevent stale JavaScript behavior
       {
         source: '/game/:roomCode*',

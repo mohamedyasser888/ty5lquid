@@ -232,7 +232,6 @@ export default function RoomPage() {
       team: String(myTeam?.team_number ?? 1),
       t1: t1?.name || 'Team 1',
       t2: t2?.name || 'Team 2',
-      captain: String(room.mode === 'solo' || myTeam?.captain_id === profile.id),
       starter: String(room.starting_team === 2 ? 2 : 1),
       h1: teamMembers.filter(tm => teams.find(t => t.id === tm.team_id)?.team_number === 1).map(tm => tm.profiles.house).join(','),
       h2: teamMembers.filter(tm => teams.find(t => t.id === tm.team_id)?.team_number === 2).map(tm => tm.profiles.house).join(','),
@@ -262,16 +261,16 @@ export default function RoomPage() {
         const serverStarter: 1 | 2 = data?.starting_team ?? 1
         console.log('[COIN FLIP] Server returned starting_team:', serverStarter, '(1=Purple, 2=Yellow)')
         console.log('[COIN FLIP] Full data:', data)
-        // TEMPORARY FIX: Invert the result to match the visual
-        // Remove this once the server logic is fixed
-        const correctedStarter = serverStarter === 1 ? 2 : 1
-        console.log('[COIN FLIP] Using corrected starter:', correctedStarter, '(inverted from server)')
-        setCoinFlipResult(correctedStarter)
+        // Use server result directly — no inversion needed
+        setCoinFlipResult(serverStarter)
 
-        // Broadcast coin flip result to all clients via realtime
-        const channelName = `room:${roomCode}-${Math.random()}`
-        const broadcastChannel = supabase.channel(channelName)
-        broadcastChannel.send({
+        // Broadcast coin flip result to all clients via realtime.
+        // IMPORTANT: channel name must be deterministic (no Math.random()) so
+        // the subscriber (setupRealtimeSubscription) is on the same channel.
+        const broadcastChannelName = `coin-flip:${roomCode.toUpperCase()}`
+        const broadcastChannel = supabase.channel(broadcastChannelName)
+        await broadcastChannel.subscribe()
+        await broadcastChannel.send({
           type: 'broadcast',
           event: 'coin_flip',
           payload: { result: serverStarter }
@@ -302,16 +301,14 @@ export default function RoomPage() {
             const t2Name = t2?.name || 'Team 2'
             
             // Solo mode: always captain. Team mode: captain if this player is the team captain.
-            const isSoloMode = room?.mode === 'solo'
-            const amICaptain = isSoloMode || myTeam?.captain_id === profile?.id
             
-            // Navigate to game with starter parameter from coin flip result
-            const finalStarter = coinFlipResult || syncedCoinResult || 1
+            // Navigate to game with starter parameter from coin flip result.
+            // Use serverStarter directly (not coinFlipResult state) to avoid stale closure.
+            const finalStarter = serverStarter
             console.log('[NAVIGATE] Going to game with starter:', finalStarter, '(1=Purple, 2=Yellow)')
-            console.log('[NAVIGATE] coinFlipResult:', coinFlipResult, 'syncedCoinResult:', syncedCoinResult)
             const h1Houses = teamMembers.filter(tm => teams.find(t => t.id === tm.team_id)?.team_number === 1).map(tm => tm.profiles.house).join(',')
             const h2Houses = teamMembers.filter(tm => teams.find(t => t.id === tm.team_id)?.team_number === 2).map(tm => tm.profiles.house).join(',')
-            router.push(`/game/${roomCode}?team=${myTeamNumber}&t1=${encodeURIComponent(t1Name)}&t2=${encodeURIComponent(t2Name)}&captain=${amICaptain}&starter=${finalStarter}&h1=${encodeURIComponent(h1Houses)}&h2=${encodeURIComponent(h2Houses)}`)
+            router.push(`/game/${roomCode}?team=${myTeamNumber}&t1=${encodeURIComponent(t1Name)}&t2=${encodeURIComponent(t2Name)}&starter=${finalStarter}&h1=${encodeURIComponent(h1Houses)}&h2=${encodeURIComponent(h2Houses)}`)
           }, 1000)  // Short delay after fadeout
         }, 500)  // Fadeout duration
       }, 7000)  // 7 seconds for coin flip (4s animation + 3s result)
@@ -344,14 +341,12 @@ export default function RoomPage() {
               const t1Name = t1?.name || 'Team 1'
               const t2Name = t2?.name || 'Team 2'
 
-              const isSoloMode = room?.mode === 'solo'
-              const amICaptain = isSoloMode || myTeam?.captain_id === profile?.id
 
               const finalStarter = syncedCoinResult || coinFlipResult || 1
               console.log('[NAVIGATE SYNCED] Going to game with starter:', finalStarter, '(1=Purple, 2=Yellow)')
               const h1Houses = teamMembers.filter(tm => teams.find(t => t.id === tm.team_id)?.team_number === 1).map(tm => tm.profiles.house).join(',')
               const h2Houses = teamMembers.filter(tm => teams.find(t => t.id === tm.team_id)?.team_number === 2).map(tm => tm.profiles.house).join(',')
-              router.push(`/game/${roomCode}?team=${myTeamNumber}&t1=${encodeURIComponent(t1Name)}&t2=${encodeURIComponent(t2Name)}&captain=${amICaptain}&starter=${finalStarter}&h1=${encodeURIComponent(h1Houses)}&h2=${encodeURIComponent(h2Houses)}`)
+              router.push(`/game/${roomCode}?team=${myTeamNumber}&t1=${encodeURIComponent(t1Name)}&t2=${encodeURIComponent(t2Name)}&starter=${finalStarter}&h1=${encodeURIComponent(h1Houses)}&h2=${encodeURIComponent(h2Houses)}`)
             }, 1000)
           }, 500)
         }, 7000)
@@ -421,8 +416,13 @@ export default function RoomPage() {
   }
 
   const setupRealtimeSubscription = () => {
-    // Subscribe to room changes
-    const channelName = `room:${roomCode}-${Math.random()}`
+    // Subscribe to room changes.
+    // IMPORTANT: channel name must be deterministic so the coin_flip broadcast
+    // from begin_quidditch_match can reach this subscriber.
+    // The coin flip broadcaster uses `coin-flip:${roomCode}` as its channel.
+    // We subscribe to room DB changes on a separate fixed channel.
+    const channelName = `room-lobby:${roomCode.toUpperCase()}`
+    const coinFlipChannelName = `coin-flip:${roomCode.toUpperCase()}`
     const roomSubscription = supabase
       .channel(channelName, {
         config: {
@@ -453,6 +453,13 @@ export default function RoomPage() {
       }, () => {
         loadRoomData()
       })
+      .subscribe()
+
+    // Separate channel for coin flip broadcast — must match the broadcaster's channel name exactly.
+    const coinFlipSubscription = supabase
+      .channel(coinFlipChannelName, {
+        config: { broadcast: { self: false } }
+      })
       .on('broadcast', { event: 'coin_flip' }, ({ payload }: { payload: { result: 1 | 2 } }) => {
         console.log('[REALTIME] Coin flip result received:', payload.result)
         setSyncedCoinResult(payload.result)
@@ -462,6 +469,7 @@ export default function RoomPage() {
 
     return () => {
       supabase.removeChannel(roomSubscription)
+      supabase.removeChannel(coinFlipSubscription)
     }
   }
 
@@ -1191,8 +1199,8 @@ export default function RoomPage() {
           <MagicalCoin
             result={coinFlipResult}
             flipping={coinFlipping}
-            t1Name={teams[0]?.name || 'Team 1'}
-            t2Name={teams[1]?.name || 'Team 2'}
+            t1Name={teams.find(team => team.team_number === 1)?.name || 'Team 1'}
+            t2Name={teams.find(team => team.team_number === 2)?.name || 'Team 2'}
           />
         )}
 

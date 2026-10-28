@@ -29,6 +29,7 @@ export default function LoginPage() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
+
     setLoading(true)
 
     try {
@@ -36,22 +37,14 @@ export default function LoginPage() {
       const sanitizedMagicalName = magicalName.toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '')
       const email = `${sanitizedMagicalName}@gmail.com`
       
-      // Try to sign in with email and password
-      const { data: authData, error: signInError } = await supabase.auth.signInWithPassword({
+      const { error: signInError } = await supabase.auth.signInWithPassword({
         email,
         password,
       })
 
       if (signInError) {
+        console.error('[LOGIN] Sign-in rejected:', signInError)
         setError('The ancient records could not verify your identity.')
-        setLoading(false)
-        return
-      }
-
-      // The house is stored in the signed-in user's metadata at registration,
-      // so no additional profile query is needed before navigating.
-      if (authData.user.user_metadata.house !== house) {
-        setError('House does not match our records.')
         setLoading(false)
         return
       }
